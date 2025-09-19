@@ -4,12 +4,12 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional
+from typing import Callable, Deque, List, Optional
 
 import torch
 
 from .agent import PolicyAgent
-from .game import OmokState, play_game
+from .game import Move, Player, OmokState, play_game
 
 
 @dataclass
@@ -50,6 +50,7 @@ def train_self_play(
     agent_black: Optional[PolicyAgent] = None,
     agent_white: Optional[PolicyAgent] = None,
     progress_callback: Optional[callable] = None,
+    move_callback: Optional[Callable[[int, int, Move, Player, OmokState], None]] = None,
 ) -> TrainingResult:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent_black = agent_black or PolicyAgent(board_size=config.board_size, learning_rate=config.learning_rate, epsilon=config.epsilon, device=device)
@@ -68,7 +69,17 @@ def train_self_play(
         agent_black.begin_episode()
         agent_white.begin_episode()
 
-        winner, _ = play_game(state, agent_black, agent_white)
+        game_move_callback = None
+        if move_callback:
+            def game_move_callback(snapshot: OmokState, move: Move, player: Player, move_index: int) -> None:
+                move_callback(episode, move_index, move, player, snapshot)
+
+        winner, _ = play_game(
+            state,
+            agent_black,
+            agent_white,
+            move_callback=game_move_callback,
+        )
 
         if winner == 1:
             black_reward, white_reward = 1.0, -1.0

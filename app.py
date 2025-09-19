@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -11,10 +11,104 @@ import torch
 
 from omok.agent import PolicyAgent
 from omok.checkpoint import CHECKPOINT_DIR, list_checkpoints, load_checkpoint, save_checkpoint
-from omok.game import OmokState
+from omok.game import Move, OmokState
 from omok.training import TrainingConfig, TrainingMetrics, train_self_play
 
 st.set_page_config(page_title="Omok RL Trainer", layout="wide")
+
+CUSTOM_CSS = """
+<style>
+:root {
+    --omok-wood-light: #f6dfb4;
+    --omok-wood-dark: #ebc988;
+    --omok-line: rgba(120, 72, 20, 0.45);
+    --omok-highlight: rgba(255, 176, 58, 0.55);
+}
+.stApp {
+    background: radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.4)), #fbf7ef;
+}
+.omok-preview {
+    display: inline-block;
+    padding: 1rem;
+    background: linear-gradient(135deg, rgba(255, 255, 255, 0.8), rgba(255, 255, 255, 0.2)), var(--omok-wood-light);
+    border-radius: 1rem;
+    box-shadow: 0 12px 28px rgba(74, 42, 5, 0.18);
+    border: 1px solid rgba(138, 94, 45, 0.35);
+}
+.omok-preview table {
+    border-collapse: collapse;
+    margin: 0 auto;
+}
+.omok-preview th {
+    font-weight: 600;
+    font-size: 0.85rem;
+    padding: 0.25rem 0.35rem;
+    color: #6a3f0b;
+    text-align: center;
+}
+.omok-preview td {
+    width: 2.6rem;
+    height: 2.6rem;
+    border: 1px solid var(--omok-line);
+    text-align: center;
+    vertical-align: middle;
+    font-size: 1.6rem;
+    background: radial-gradient(circle at center, rgba(0, 0, 0, 0.1) 8%, transparent 9%), var(--omok-wood-dark);
+    color: #111;
+}
+.omok-preview td.white {
+    color: #f8f8f8;
+    text-shadow: 0 0 6px rgba(0, 0, 0, 0.55);
+}
+.omok-preview td.black {
+    color: #111;
+    text-shadow: 0 0 3px rgba(0, 0, 0, 0.35);
+}
+.omok-preview td.empty {
+    color: rgba(0, 0, 0, 0);
+}
+.omok-preview td.highlight {
+    box-shadow: inset 0 0 0 3px var(--omok-highlight);
+    background: radial-gradient(circle at center, rgba(255, 215, 0, 0.35) 20%, transparent 50%), var(--omok-wood-dark);
+}
+.omok-preview .board-caption {
+    margin-top: 0.75rem;
+    text-align: center;
+    font-size: 0.85rem;
+    color: #6a3f0b;
+    font-weight: 600;
+}
+.omok-interactive div[data-testid="column"] {
+    padding: 0.05rem 0.1rem !important;
+}
+.omok-interactive div[data-testid="stButton"] > button {
+    width: 100%;
+    aspect-ratio: 1;
+    border-radius: 0.35rem;
+    border: 1px solid var(--omok-line);
+    background: radial-gradient(circle at center, rgba(0, 0, 0, 0.1) 8%, transparent 9%), var(--omok-wood-dark);
+    font-size: 1.55rem;
+    color: #111;
+    transition: transform 0.05s ease-in-out, box-shadow 0.1s ease-in-out;
+}
+.omok-interactive div[data-testid="stButton"] > button:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 18px rgba(0, 0, 0, 0.12);
+}
+.omok-interactive div[data-testid="stButton"] > button:disabled {
+    opacity: 0.85;
+    color: #111;
+}
+.omok-interactive .coord-label {
+    text-align: center;
+    font-weight: 600;
+    color: #6a3f0b;
+    padding: 0.2rem 0;
+}
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 def init_session_state() -> None:
@@ -30,6 +124,45 @@ def init_session_state() -> None:
         st.session_state["play_user_color"] = "black"
     if "active_checkpoint" not in st.session_state:
         st.session_state["active_checkpoint"] = None
+
+
+def board_preview_html(state: OmokState, highlight: Optional[Move] = None, caption: Optional[str] = None) -> str:
+    size = state.size
+    highlight = tuple(highlight) if highlight is not None else None
+    header_cells = "".join(f"<th>{idx}</th>" for idx in range(1, size + 1))
+    header = f"<tr><th></th>{header_cells}</tr>"
+    rows = []
+    for row in range(size):
+        cells = [f"<th>{row + 1}</th>"]
+        for col in range(size):
+            value = state.board[row, col]
+            classes = ["cell"]
+            if value == 1:
+                classes.append("black")
+                symbol = "●"
+            elif value == -1:
+                classes.append("white")
+                symbol = "○"
+            else:
+                classes.append("empty")
+                symbol = ""
+            if highlight == (row, col):
+                classes.append("highlight")
+            class_name = " ".join(classes)
+            cells.append(f"<td class=\"{class_name}\">{symbol}</td>")
+        rows.append(f"<tr>{''.join(cells)}</tr>")
+    caption_html = f"<div class='board-caption'>{caption}</div>" if caption else ""
+    return "".join(
+        [
+            "<div class='omok-preview'>",
+            "<table>",
+            header,
+            "".join(rows),
+            "</table>",
+            caption_html,
+            "</div>",
+        ]
+    )
 
 
 def ensure_agents(config: TrainingConfig) -> Dict[str, object]:
@@ -78,11 +211,13 @@ def run_training_ui():
 
     with st.form("training_form"):
         board_size = st.slider("바둑판 크기", min_value=5, max_value=15, value=9)
-        episodes = st.number_input("에피소드 수", min_value=10, max_value=2000, value=200, step=10)
+        episodes = st.number_input("에피소드 수", min_value=10, max_value=100000, value=200, step=10)
         learning_rate = st.number_input("학습률", min_value=1e-4, max_value=1e-1, value=1e-3, step=1e-4, format="%.5f")
         epsilon = st.slider("탐험 비율 (epsilon)", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
         report_interval = st.number_input("리포트 주기", min_value=1, max_value=200, value=20)
         rolling_window = st.number_input("승률 이동 평균 길이", min_value=5, max_value=200, value=50)
+        show_training_visual = st.checkbox("학습 대국 실시간 보기", value=True)
+        visual_delay = st.slider("수 시각화 지연 (초)", min_value=0.0, max_value=0.3, value=0.05, step=0.01)
         submitted = st.form_submit_button("학습 시작")
 
     if submitted:
@@ -96,13 +231,52 @@ def run_training_ui():
             rolling_window=int(rolling_window),
         )
         agents_bundle = ensure_agents(config)
-        placeholder_chart = st.empty()
-        placeholder_metrics = st.empty()
+        if not show_training_visual:
+            visual_delay = 0.0
+
+        if show_training_visual:
+            col_visual, col_metrics = st.columns([1, 2])
+            with col_visual:
+                st.caption("실시간 자기대국")
+                board_placeholder = st.empty()
+                move_placeholder = st.empty()
+                board_placeholder.markdown(
+                    board_preview_html(
+                        OmokState(size=config.board_size, win_length=config.win_length),
+                        caption="대국 준비중",
+                    ),
+                    unsafe_allow_html=True,
+                )
+                move_placeholder.caption("학습 수를 기다리는 중...")
+        else:
+            col_metrics = st.container()
+            board_placeholder = None
+            move_placeholder = None
+
+        with col_metrics:
+            placeholder_chart = st.empty()
+            placeholder_metrics = st.empty()
         progress_bar = st.progress(0)
         status_text = st.empty()
 
         total_reports = max(1, math.ceil(config.episodes / config.report_interval))
         reports_seen = 0
+
+        def visualize_move(episode_idx: int, move_idx: int, move: Move, player: int, snapshot: OmokState) -> None:
+            if board_placeholder is None:
+                return
+            color = "흑" if player == 1 else "백"
+            caption = f"에피소드 {episode_idx:,} / {config.episodes:,} · {color}"
+            board_placeholder.markdown(
+                board_preview_html(snapshot, highlight=move, caption=caption),
+                unsafe_allow_html=True,
+            )
+            move_placeholder.markdown(
+                f"**최근 수:** {color} ({move[0] + 1}, {move[1] + 1})",
+                unsafe_allow_html=True,
+            )
+            if visual_delay > 0:
+                time.sleep(visual_delay)
 
         def progress_callback(metric: TrainingMetrics):
             nonlocal reports_seen
@@ -119,6 +293,7 @@ def run_training_ui():
             agent_black=agents_bundle["black"],
             agent_white=agents_bundle["white"],
             progress_callback=progress_callback,
+            move_callback=visualize_move if show_training_visual else None,
         )
         progress_bar.progress(1.0)
         elapsed = time.time() - start_time
@@ -171,38 +346,61 @@ def render_board(state: OmokState):
     size = state.size
     user_color = st.session_state["play_user_color"]
     user_turn = 1 if user_color == "black" else -1
-    for row in range(size):
-        cols = st.columns(size)
-        for col in range(size):
-            cell_value = state.board[row, col]
-            label = "·"
-            if cell_value == 1:
-                label = "●"
-            elif cell_value == -1:
-                label = "○"
-            disabled = cell_value != 0 or state.winner is not None or state.current_player != user_turn
-            if cols[col].button(label, key=f"cell_{row}_{col}", use_container_width=True, disabled=disabled):
-                state.apply_move((row, col))
-                if state.winner is not None:
-                    if state.winner == 0:
-                        st.session_state["play_message"] = "무승부입니다."
-                    elif (state.winner == 1 and user_color == "black") or (state.winner == -1 and user_color == "white"):
-                        st.session_state["play_message"] = "축하합니다! 당신이 승리했습니다."
-                    else:
-                        st.session_state["play_message"] = "아쉽네요! 에이전트가 승리했습니다."
-                else:
-                    agent_color = "white" if user_color == "black" else "black"
-                    agent_move(state, agent_color)
-                    if state.winner is None:
-                        st.session_state["play_message"] = "당신의 차례입니다."
-                    else:
-                        if state.winner == 0:
-                            st.session_state["play_message"] = "무승부입니다."
-                        elif (state.winner == 1 and user_color == "black") or (state.winner == -1 and user_color == "white"):
-                            st.session_state["play_message"] = "축하합니다! 당신이 승리했습니다."
-                        else:
-                            st.session_state["play_message"] = "아쉽네요! 에이전트가 승리했습니다."
-                return  # ensure single move per click
+    clicked_move: Optional[Tuple[int, int]] = None
+
+    board_container = st.container()
+    with board_container:
+        st.markdown("<div class='omok-preview omok-interactive'>", unsafe_allow_html=True)
+        header_cols = st.columns([0.8] + [1] * size)
+        header_cols[0].markdown("&nbsp;", unsafe_allow_html=True)
+        for idx, col in enumerate(header_cols[1:], start=1):
+            col.markdown(f"<div class='coord-label'>{idx}</div>", unsafe_allow_html=True)
+
+        for row in range(size):
+            row_cols = st.columns([0.8] + [1] * size)
+            row_cols[0].markdown(f"<div class='coord-label'>{row + 1}</div>", unsafe_allow_html=True)
+            for col in range(size):
+                cell_value = state.board[row, col]
+                label = "●" if cell_value == 1 else "○" if cell_value == -1 else ""
+                disabled = (
+                    cell_value != 0
+                    or state.winner is not None
+                    or state.current_player != user_turn
+                )
+                if (
+                    row_cols[col + 1].button(
+                        label or " ",
+                        key=f"cell_{row}_{col}",
+                        use_container_width=True,
+                        disabled=disabled,
+                    )
+                    and clicked_move is None
+                ):
+                    clicked_move = (row, col)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if clicked_move is not None:
+        state.apply_move(clicked_move)
+        if state.winner is not None:
+            if state.winner == 0:
+                st.session_state["play_message"] = "무승부입니다."
+            elif (state.winner == 1 and user_color == "black") or (state.winner == -1 and user_color == "white"):
+                st.session_state["play_message"] = "축하합니다! 당신이 승리했습니다."
+            else:
+                st.session_state["play_message"] = "아쉽네요! 에이전트가 승리했습니다."
+            return
+
+        agent_color = "white" if user_color == "black" else "black"
+        agent_move(state, agent_color)
+        if state.winner is None:
+            st.session_state["play_message"] = "당신의 차례입니다."
+        else:
+            if state.winner == 0:
+                st.session_state["play_message"] = "무승부입니다."
+            elif (state.winner == 1 and user_color == "black") or (state.winner == -1 and user_color == "white"):
+                st.session_state["play_message"] = "축하합니다! 당신이 승리했습니다."
+            else:
+                st.session_state["play_message"] = "아쉽네요! 에이전트가 승리했습니다."
 
 
 def run_play_ui():
@@ -256,6 +454,18 @@ def run_play_ui():
     with col_board:
         st.write("**게임 보드**")
         render_board(state)
+        st.markdown(
+            board_preview_html(state, highlight=state.last_move, caption="현재 판"),
+            unsafe_allow_html=True,
+        )
+        if state.last_move is not None:
+            if state.winner in (1, -1):
+                last_player = state.winner
+            else:
+                last_player = -state.current_player
+            color_name = "흑" if last_player == 1 else "백"
+            move_row, move_col = state.last_move
+            st.caption(f"마지막 수: {color_name} ({move_row + 1}, {move_col + 1})")
         if state.winner is not None:
             if state.winner == 0:
                 st.success("무승부입니다!")

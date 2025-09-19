@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -107,15 +107,19 @@ def play_game(
     agent_black,
     agent_white,
     max_moves: Optional[int] = None,
+    move_callback: Optional[Callable[[OmokState, Move, Player, int], None]] = None,
 ) -> Tuple[Optional[Player], List[Move]]:
     """Plays a single game between two agents and returns the winner."""
 
     state = state.clone()
     max_moves = max_moves or state.size * state.size
-    for _ in range(max_moves):
+    for move_index in range(max_moves):
         current_agent = agent_black if state.current_player == 1 else agent_white
+        current_player = state.current_player
         move = current_agent.select_move(state)
         state.apply_move(move)
+        if move_callback:
+            move_callback(state.clone(), move, current_player, move_index)
         if state.winner is not None:
             return state.winner, list(state.move_history)
     return 0, list(state.move_history)
