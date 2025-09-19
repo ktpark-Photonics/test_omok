@@ -133,7 +133,7 @@ def init_session_state() -> None:
     if "active_checkpoint" not in st.session_state:
         st.session_state["active_checkpoint"] = None
     if "device_preference" not in st.session_state:
-        st.session_state["device_preference"] = "auto"
+        st.session_state["device_preference"] = "auto
 
 
 def board_preview_html(state: OmokState, highlight: Optional[Move] = None, caption: Optional[str] = None) -> str:
@@ -593,7 +593,6 @@ def run_play_ui():
         )
     else:
         st.session_state["play_selected_agent"] = 0
-
     col_settings, col_board = st.columns([1, 2])
 
     with col_settings:
