@@ -2,7 +2,13 @@
 
 from .agent import PolicyAgent
 from .game import OmokState, play_game
-from .training import TrainingConfig, TrainingMetrics, TrainingResult, train_self_play
+from .training import (
+    TrainingConfig,
+    TrainingMetrics,
+    TrainingResult,
+    resolve_device,
+    train_self_play,
+)
 
 __all__ = [
     "PolicyAgent",
@@ -11,5 +17,6 @@ __all__ = [
     "TrainingConfig",
     "TrainingMetrics",
     "TrainingResult",
+    "resolve_device",
     "train_self_play",
 ]

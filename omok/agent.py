@@ -135,3 +135,15 @@ class PolicyAgent:
         )
         clone_agent.load_state_dict(self.state_dict())
         return clone_agent
+
+    def to(self, device: torch.device) -> "PolicyAgent":
+        if device == self.device:
+            return self
+        self._policy.to(device)
+        for state in self._optimizer.state.values():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(device)
+        self._log_probs = [log_prob.to(device) for log_prob in self._log_probs]
+        self.device = device
+        return self

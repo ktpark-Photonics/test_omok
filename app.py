@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -12,7 +12,13 @@ import torch
 from omok.agent import PolicyAgent
 from omok.checkpoint import CHECKPOINT_DIR, list_checkpoints, load_checkpoint, save_checkpoint
 from omok.game import Move, OmokState
-from omok.training import TrainingConfig, TrainingMetrics, train_self_play
+from omok.training import (
+    AgentStanding,
+    TrainingConfig,
+    TrainingMetrics,
+    resolve_device,
+    train_self_play,
+)
 
 st.set_page_config(page_title="Omok RL Trainer", layout="wide")
 
@@ -122,8 +128,12 @@ def init_session_state() -> None:
         st.session_state["play_message"] = "에이전트와 대국을 시작해보세요!"
     if "play_user_color" not in st.session_state:
         st.session_state["play_user_color"] = "black"
+    if "play_selected_agent" not in st.session_state:
+        st.session_state["play_selected_agent"] = 0
     if "active_checkpoint" not in st.session_state:
         st.session_state["active_checkpoint"] = None
+    if "device_preference" not in st.session_state:
+        st.session_state["device_preference"] = "auto
 
 
 def board_preview_html(state: OmokState, highlight: Optional[Move] = None, caption: Optional[str] = None) -> str:
@@ -165,62 +175,146 @@ def board_preview_html(state: OmokState, highlight: Optional[Move] = None, capti
     )
 
 
-def ensure_agents(config: TrainingConfig) -> Dict[str, object]:
+def device_options() -> Dict[str, str]:
+    options = {"auto": "자동 선택 (GPU 우선)", "cpu": "CPU"}
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            name = torch.cuda.get_device_name(index)
+            key = f"cuda:{index}" if torch.cuda.device_count() > 1 else "cuda"
+            if key in options:
+                key = f"cuda:{index}"
+            options[key] = f"CUDA {index} · {name}"
+    return options
+
+
+def ensure_agents(config: TrainingConfig, resolved_device: Optional[torch.device] = None) -> Dict[str, object]:
     agents_bundle = st.session_state.get("agents")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not agents_bundle or agents_bundle["config"].board_size != config.board_size:
-        agent_black = PolicyAgent(board_size=config.board_size, learning_rate=config.learning_rate, epsilon=config.epsilon, device=device)
-        agent_white = PolicyAgent(board_size=config.board_size, learning_rate=config.learning_rate, epsilon=config.epsilon, device=device)
+    try:
+        device = resolved_device or resolve_device(config.device)
+    except RuntimeError as exc:
+        st.error(str(exc))
+        raise
+    if agents_bundle and "list" not in agents_bundle:
+        legacy_agents = [agents_bundle.get("black"), agents_bundle.get("white")]
+        agents_bundle["list"] = [agent for agent in legacy_agents if agent is not None]
+        agents_bundle.setdefault("standings", [])
+    needs_new = True
+    if agents_bundle:
+        prev_config: TrainingConfig = agents_bundle.get("config", config)
+        needs_new = (
+            prev_config.board_size != config.board_size
+            or prev_config.win_length != config.win_length
+            or len(agents_bundle.get("list", [])) != config.num_agents
+            or getattr(prev_config, "device", "auto") != config.device
+        )
+    if needs_new:
+        agents = [
+            PolicyAgent(
+                board_size=config.board_size,
+                learning_rate=config.learning_rate,
+                epsilon=config.epsilon,
+                device=device,
+            )
+            for _ in range(config.num_agents)
+        ]
         st.session_state["agents"] = {
-            "black": agent_black,
-            "white": agent_white,
+            "list": agents,
             "config": config,
+            "standings": [],
         }
     else:
         agents_bundle["config"] = config
-        agents_bundle["black"].update_hyperparameters(learning_rate=config.learning_rate, epsilon=config.epsilon)
-        agents_bundle["white"].update_hyperparameters(learning_rate=config.learning_rate, epsilon=config.epsilon)
+        agents_bundle.setdefault("standings", [])
+        for agent in agents_bundle.get("list", []):
+            agent.update_hyperparameters(
+                learning_rate=config.learning_rate,
+                epsilon=config.epsilon,
+            )
+            agent.to(device)
     return st.session_state["agents"]
 
 
 def update_training_history(metric: TrainingMetrics, placeholder_chart, placeholder_metrics):
     st.session_state["training_history"].append(metric)
-    history_df = pd.DataFrame([
-        {
-            "episode": m.episode,
-            "black_win_rate": m.black_win_rate,
-            "white_win_rate": m.white_win_rate,
-            "black_loss": m.black_loss,
-            "white_loss": m.white_loss,
-            "best_black": m.best_black_win_rate,
-            "best_white": m.best_white_win_rate,
-        }
-        for m in st.session_state["training_history"]
-    ])
-    history_df.set_index("episode", inplace=True)
-    placeholder_chart.line_chart(history_df[["black_win_rate", "white_win_rate"]])
+    history_records = []
+    for entry in st.session_state["training_history"]:
+        top = entry.standings[0] if entry.standings else None
+        history_records.append(
+            {
+                "round": entry.round_index,
+                "top_win_rate": top.win_rate if top else 0.0,
+                "top_recent": top.recent_win_rate if top else 0.0,
+            }
+        )
+    history_df = pd.DataFrame(history_records)
+    if not history_df.empty:
+        history_df.set_index("round", inplace=True)
+        placeholder_chart.line_chart(history_df)
+    else:
+        placeholder_chart.empty()
     with placeholder_metrics.container():
-        col_a, col_b = st.columns(2)
-        col_a.metric("최근 블랙 평균 승률", f"{metric.black_win_rate:.2f}", delta=f"최고 {metric.best_black_win_rate:.2f}")
-        col_b.metric("최근 화이트 평균 승률", f"{metric.white_win_rate:.2f}", delta=f"최고 {metric.best_white_win_rate:.2f}")
+        if metric.standings:
+            top = metric.standings[0]
+            runner_up = metric.standings[1] if len(metric.standings) > 1 else None
+            col_a, col_b = st.columns(2)
+            col_a.metric(
+                "리그 1위 누적 승률",
+                f"{top.win_rate:.2f}",
+                delta=f"최근 {top.recent_win_rate:.2f}",
+            )
+            if runner_up:
+                col_b.metric(
+                    "리그 2위 누적 승률",
+                    f"{runner_up.win_rate:.2f}",
+                    delta=f"최근 {runner_up.recent_win_rate:.2f}",
+                )
+            else:
+                col_b.metric("참여 에이전트 수", f"{len(metric.standings)}명")
+        else:
+            placeholder_metrics.empty()
 
 
 def run_training_ui():
-    st.header("🔁 자기대국 학습")
-    st.write("두 에이전트가 서로 대국하며 정책을 학습합니다. 학습이 진행되는 동안 실시간으로 승률과 손실을 확인할 수 있습니다.")
+    st.header("🔁 리그 자기대국 학습")
+    st.write(
+        "여러 에이전트가 리그전을 치르며 서로 학습합니다. 라운드마다 짝을 바꿔 대국하고, 승패에 따라 보상이 적용됩니다."
+    )
 
     with st.form("training_form"):
         board_size = st.slider("바둑판 크기", min_value=5, max_value=15, value=9)
-        episodes = st.number_input("에피소드 수", min_value=10, max_value=100000, value=200, step=10)
+        num_agents = st.number_input("에이전트 수 (짝수)", min_value=2, max_value=32, value=4, step=2)
+        episodes = st.number_input("리그 라운드 수", min_value=1, max_value=100000, value=50, step=1)
         learning_rate = st.number_input("학습률", min_value=1e-4, max_value=1e-1, value=1e-3, step=1e-4, format="%.5f")
         epsilon = st.slider("탐험 비율 (epsilon)", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
-        report_interval = st.number_input("리포트 주기", min_value=1, max_value=200, value=20)
-        rolling_window = st.number_input("승률 이동 평균 길이", min_value=5, max_value=200, value=50)
+        report_interval = st.number_input("리포트 주기", min_value=1, max_value=500, value=10)
+        rolling_window = st.number_input("승률 이동 평균 길이", min_value=5, max_value=500, value=50)
+        device_map = device_options()
+        preferred_device = st.session_state.get("device_preference", "auto")
+        option_values = list(device_map.keys())
+        if preferred_device not in option_values:
+            option_values.insert(0, preferred_device)
+
+        def device_label(key: str) -> str:
+            if key in device_map:
+                return device_map[key]
+            return f"사용 불가: {key}"
+
+        device_index = option_values.index(preferred_device) if preferred_device in option_values else 0
+        device_choice = st.selectbox(
+            "연산 장치",
+            options=option_values,
+            index=device_index,
+            format_func=device_label,
+            help="GPU(CUDA)가 감지되면 자동으로 목록에 표시됩니다. RTX 50 시리즈 등 최신 GPU도 CUDA 빌드 PyTorch로 사용 가능합니다.",
+        )
         show_training_visual = st.checkbox("학습 대국 실시간 보기", value=True)
         visual_delay = st.slider("수 시각화 지연 (초)", min_value=0.0, max_value=0.3, value=0.05, step=0.01)
         submitted = st.form_submit_button("학습 시작")
 
     if submitted:
+        if int(num_agents) % 2 != 0:
+            st.error("에이전트 수는 짝수여야 합니다.")
+            return
         config = TrainingConfig(
             board_size=int(board_size),
             win_length=5,
@@ -229,29 +323,57 @@ def run_training_ui():
             epsilon=float(epsilon),
             report_interval=int(report_interval),
             rolling_window=int(rolling_window),
+            num_agents=int(num_agents),
+            device=device_choice,
         )
-        agents_bundle = ensure_agents(config)
+        st.session_state["device_preference"] = device_choice
+        try:
+            resolved_device = resolve_device(config.device)
+        except RuntimeError as exc:
+            st.error(str(exc))
+            return
+        try:
+            agents_bundle = ensure_agents(config, resolved_device)
+        except RuntimeError:
+            return
         if not show_training_visual:
             visual_delay = 0.0
 
+        num_matches = max(1, config.num_agents // 2)
+
         if show_training_visual:
-            col_visual, col_metrics = st.columns([1, 2])
+            col_visual, col_metrics = st.columns([1.3, 1.0])
+            board_placeholders: List = []
+            move_placeholders: List = []
             with col_visual:
-                st.caption("실시간 자기대국")
-                board_placeholder = st.empty()
-                move_placeholder = st.empty()
-                board_placeholder.markdown(
-                    board_preview_html(
-                        OmokState(size=config.board_size, win_length=config.win_length),
-                        caption="대국 준비중",
-                    ),
-                    unsafe_allow_html=True,
-                )
-                move_placeholder.caption("학습 수를 기다리는 중...")
+                st.caption("실시간 리그 경기")
+                cols_per_row = min(4, num_matches)
+                rows = math.ceil(num_matches / cols_per_row)
+                match_index = 0
+                for _ in range(rows):
+                    row_columns = st.columns(cols_per_row)
+                    for col in row_columns:
+                        if match_index >= num_matches:
+                            break
+                        with col:
+                            st.markdown(f"**매치 {match_index + 1}**")
+                            board_ph = st.empty()
+                            move_ph = st.empty()
+                            board_ph.markdown(
+                                board_preview_html(
+                                    OmokState(size=config.board_size, win_length=config.win_length),
+                                    caption="대국 대기중",
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                            move_ph.caption("준비 중...")
+                            board_placeholders.append(board_ph)
+                            move_placeholders.append(move_ph)
+                            match_index += 1
         else:
             col_metrics = st.container()
-            board_placeholder = None
-            move_placeholder = None
+            board_placeholders = []
+            move_placeholders = []
 
         with col_metrics:
             placeholder_chart = st.empty()
@@ -262,20 +384,51 @@ def run_training_ui():
         total_reports = max(1, math.ceil(config.episodes / config.report_interval))
         reports_seen = 0
 
-        def visualize_move(episode_idx: int, move_idx: int, move: Move, player: int, snapshot: OmokState) -> None:
-            if board_placeholder is None:
+        def visualize_move(
+            round_idx: int,
+            match_idx: int,
+            move_idx: int,
+            move: Optional[Move],
+            player: int,
+            snapshot: OmokState,
+            pairing: Tuple[int, int],
+        ) -> None:
+            if match_idx >= len(board_placeholders):
+                return
+            black_idx, white_idx = pairing
+            title = (
+                f"라운드 {round_idx} · 에이전트 {black_idx + 1} (흑) vs 에이전트 {white_idx + 1} (백)"
+            )
+            if move_idx == -1:
+                board_placeholders[match_idx].markdown(
+                    board_preview_html(snapshot, caption=title),
+                    unsafe_allow_html=True,
+                )
+                move_placeholders[match_idx].markdown("대국 시작!", unsafe_allow_html=True)
+                return
+            if move_idx == -2:
+                result_text = "무승부"
+                if player == 1:
+                    result_text = "흑 승리"
+                elif player == -1:
+                    result_text = "백 승리"
+                board_placeholders[match_idx].markdown(
+                    board_preview_html(snapshot, caption=title),
+                    unsafe_allow_html=True,
+                )
+                move_placeholders[match_idx].markdown(f"결과: {result_text}", unsafe_allow_html=True)
                 return
             color = "흑" if player == 1 else "백"
-            caption = f"에피소드 {episode_idx:,} / {config.episodes:,} · {color}"
-            board_placeholder.markdown(
-                board_preview_html(snapshot, highlight=move, caption=caption),
+            board_placeholders[match_idx].markdown(
+                board_preview_html(snapshot, highlight=move, caption=title),
                 unsafe_allow_html=True,
             )
-            move_placeholder.markdown(
-                f"**최근 수:** {color} ({move[0] + 1}, {move[1] + 1})",
-                unsafe_allow_html=True,
-            )
-            if visual_delay > 0:
+            if move is not None:
+                move_placeholders[match_idx].markdown(
+                    f"{color} ({move[0] + 1}, {move[1] + 1})",
+                    unsafe_allow_html=True,
+                )
+            if visual_delay > 0 and move_idx >= 0:
                 time.sleep(visual_delay)
 
         def progress_callback(metric: TrainingMetrics):
@@ -283,54 +436,74 @@ def run_training_ui():
             reports_seen += 1
             update_training_history(metric, placeholder_chart, placeholder_metrics)
             progress_bar.progress(min(1.0, reports_seen / total_reports))
-            status_text.info(
-                f"에피소드 {metric.episode} / {config.episodes} - 블랙 승률 {metric.black_win_rate:.2f}, 화이트 승률 {metric.white_win_rate:.2f}"
-            )
+            if metric.standings:
+                leader = metric.standings[0]
+                status_text.info(
+                    f"라운드 {metric.round_index} / {config.episodes} · 1위 에이전트 {leader.agent_index + 1} 승률 {leader.win_rate:.2f}"
+                )
+            else:
+                status_text.info(f"라운드 {metric.round_index} 진행 중")
 
         start_time = time.time()
         result = train_self_play(
             config,
-            agent_black=agents_bundle["black"],
-            agent_white=agents_bundle["white"],
+            agents=agents_bundle.get("list"),
             progress_callback=progress_callback,
             move_callback=visualize_move if show_training_visual else None,
+            device=resolved_device,
         )
         progress_bar.progress(1.0)
         elapsed = time.time() - start_time
         st.success(f"학습이 완료되었습니다! (소요 시간: {elapsed:.1f}초)")
         st.session_state["agents"] = {
-            "black": result.agent_black,
-            "white": result.agent_white,
+            "list": result.agents,
             "config": config,
+            "standings": result.standings,
         }
         st.session_state["active_checkpoint"] = None
+        st.session_state["play_selected_agent"] = min(
+            st.session_state.get("play_selected_agent", 0), len(result.agents) - 1
+        )
+
+        standings_df = pd.DataFrame([standing.to_dict() for standing in result.standings])
+        if not standings_df.empty:
+            standings_df.set_index("agent", inplace=True)
+            st.subheader("🏅 최종 리그 순위")
+            st.dataframe(standings_df)
 
     if st.session_state["training_history"]:
         st.subheader("📈 최근 학습 지표")
-        history_df = pd.DataFrame([
-            {
-                "episode": m.episode,
-                "black_win_rate": m.black_win_rate,
-                "white_win_rate": m.white_win_rate,
-                "black_loss": m.black_loss,
-                "white_loss": m.white_loss,
-                "best_black": m.best_black_win_rate,
-                "best_white": m.best_white_win_rate,
-            }
-            for m in st.session_state["training_history"]
-        ])
-        st.dataframe(history_df.set_index("episode"))
+        history_df = pd.DataFrame(
+            [
+                {
+                    "round": m.round_index,
+                    "leader": m.standings[0].agent_index + 1 if m.standings else None,
+                    "leader_win_rate": m.standings[0].win_rate if m.standings else 0.0,
+                    "leader_recent": m.standings[0].recent_win_rate if m.standings else 0.0,
+                }
+                for m in st.session_state["training_history"]
+            ]
+        )
+        st.dataframe(history_df.set_index("round"))
 
 
-def get_active_agent(color: str) -> Optional[PolicyAgent]:
+def get_agent_pool() -> List[PolicyAgent]:
     agents_bundle = st.session_state.get("agents")
     if not agents_bundle:
+        return []
+    return agents_bundle.get("list", [])
+
+
+def get_selected_agent() -> Optional[PolicyAgent]:
+    agents = get_agent_pool()
+    if not agents:
         return None
-    return agents_bundle[color]
+    index = min(st.session_state.get("play_selected_agent", 0), len(agents) - 1)
+    return agents[index]
 
 
 def agent_move(state: OmokState, color: str) -> None:
-    agent = get_active_agent(color)
+    agent = get_selected_agent()
     if agent is None:
         st.warning("학습된 에이전트가 없습니다. 먼저 학습을 진행하거나 체크포인트를 불러오세요.")
         return
@@ -412,7 +585,14 @@ def run_play_ui():
     if agents_bundle and agents_bundle["config"].board_size != state.size:
         state = OmokState(size=agents_bundle["config"].board_size, win_length=5)
         st.session_state["play_state"] = state
-
+    agent_pool = get_agent_pool()
+    standings = agents_bundle.get("standings", []) if agents_bundle else []
+    if agent_pool:
+        st.session_state["play_selected_agent"] = min(
+            st.session_state.get("play_selected_agent", 0), len(agent_pool) - 1
+        )
+    else:
+        st.session_state["play_selected_agent"] = 0
     col_settings, col_board = st.columns([1, 2])
 
     with col_settings:
@@ -433,6 +613,50 @@ def run_play_ui():
                     st.session_state["play_message"] = "당신의 차례입니다."
             else:
                 st.session_state["play_message"] = "당신이 선입니다."
+
+        if agent_pool:
+            standings_map = {standing.agent_index: standing for standing in standings}
+
+            def format_agent(idx: int) -> str:
+                standing = standings_map.get(idx)
+                if standing:
+                    return f"에이전트 {idx + 1} · 승률 {standing.win_rate:.2f}"
+                return f"에이전트 {idx + 1}"
+
+            options = list(range(len(agent_pool)))
+            default_index = (
+                options.index(st.session_state["play_selected_agent"])
+                if options and st.session_state["play_selected_agent"] in options
+                else 0
+            )
+            selected_agent = st.selectbox(
+                "대결할 에이전트",
+                options=options,
+                format_func=format_agent,
+                index=default_index,
+            )
+            if selected_agent != st.session_state["play_selected_agent"]:
+                st.session_state["play_selected_agent"] = selected_agent
+                st.session_state["play_state"] = OmokState(size=state.size, win_length=5)
+                st.session_state["play_message"] = "새로운 에이전트와의 대국을 시작합니다!"
+                state = st.session_state["play_state"]
+                if st.session_state["play_user_color"] == "white":
+                    agent_move(state, "black")
+                    if state.winner is None:
+                        st.session_state["play_message"] = "당신의 차례입니다."
+
+            selected_stats = standings_map.get(st.session_state["play_selected_agent"])
+            if selected_stats:
+                st.metric(
+                    "선택 에이전트 최근 승률",
+                    f"{selected_stats.recent_win_rate:.2f}",
+                    delta=f"최고 {selected_stats.best_recent_win_rate:.2f}",
+                )
+                st.caption(
+                    f"누적 전적: {selected_stats.wins}승 {selected_stats.draws}무 {selected_stats.losses}패"
+                )
+        else:
+            st.info("학습을 완료하거나 체크포인트를 불러오면 에이전트를 선택할 수 있습니다.")
 
         if st.button("새 게임 시작"):
             st.session_state["play_state"] = OmokState(size=state.size, win_length=5)
@@ -474,6 +698,13 @@ def run_play_ui():
             else:
                 st.success("백이 승리했습니다!")
 
+        if standings:
+            leaderboard_df = pd.DataFrame([standing.to_dict() for standing in standings])
+            if not leaderboard_df.empty:
+                leaderboard_df.set_index("agent", inplace=True)
+                st.caption("현재 리그 순위 (상위 10)")
+                st.dataframe(leaderboard_df.head(10))
+
     st.info(st.session_state["play_message"])
 
 
@@ -493,7 +724,13 @@ def run_checkpoint_ui():
             else:
                 config: TrainingConfig = agents_bundle["config"]
                 path = CHECKPOINT_DIR / f"{checkpoint_name}.pt"
-                save_checkpoint(path, agents_bundle["black"], agents_bundle["white"], config, notes=notes)
+                save_checkpoint(
+                    path,
+                    agents_bundle.get("list", []),
+                    config,
+                    standings=agents_bundle.get("standings"),
+                    notes=notes,
+                )
                 st.success(f"체크포인트가 저장되었습니다: {path}")
                 st.session_state["active_checkpoint"] = str(path)
 
@@ -507,26 +744,89 @@ def run_checkpoint_ui():
         metadata = payload.get("metadata", {})
         with st.expander(f"{metadata.get('name', ckpt_path.stem)} ({config.get('board_size', '?')}x{config.get('board_size', '?')})"):
             st.caption(f"생성 시각: {metadata.get('created_at', '알 수 없음')}")
+            saved_device = config.get("device", "auto")
+            saved_label = device_options().get(saved_device, saved_device)
+            st.caption(f"저장 당시 장치: {saved_label}")
             if metadata.get("notes"):
                 st.write(metadata["notes"])
             if st.button("이 체크포인트 불러오기", key=f"load_{ckpt_path.stem}"):
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                preferred_device = st.session_state.get("device_preference", "auto")
+                try:
+                    load_device = resolve_device(preferred_device)
+                except RuntimeError as exc:
+                    st.warning(f"{exc} CPU로 불러옵니다.")
+                    load_device = torch.device("cpu")
                 config_data = payload.get("config", {})
                 config_obj = TrainingConfig(
                     board_size=config_data.get("board_size", 9),
                     win_length=config_data.get("win_length", 5),
                     learning_rate=config_data.get("learning_rate", 1e-3),
                     epsilon=config_data.get("epsilon", 0.2),
+                    num_agents=config_data.get("num_agents", len(payload.get("agents", [])) or 2),
+                    device=preferred_device,
                 )
-                agent_black = PolicyAgent(board_size=config_obj.board_size, learning_rate=config_obj.learning_rate, epsilon=config_obj.epsilon, device=device)
-                agent_white = PolicyAgent(board_size=config_obj.board_size, learning_rate=config_obj.learning_rate, epsilon=config_obj.epsilon, device=device)
-                agent_black.load_state_dict(payload["black"])
-                agent_white.load_state_dict(payload["white"])
+                agent_states = payload.get("agents")
+                agents: List[PolicyAgent] = []
+                if agent_states:
+                    for state_dict in agent_states:
+                        agent = PolicyAgent(
+                            board_size=config_obj.board_size,
+                            learning_rate=config_obj.learning_rate,
+                            epsilon=config_obj.epsilon,
+                            device=load_device,
+                        )
+                        agent.load_state_dict(state_dict)
+                        agents.append(agent)
+                else:
+                    # 호환성을 위해 기존 흑/백 에이전트 형식도 처리
+                    black_state = payload.get("black")
+                    white_state = payload.get("white")
+                    if black_state and white_state:
+                        agent_black = PolicyAgent(
+                            board_size=config_obj.board_size,
+                            learning_rate=config_obj.learning_rate,
+                            epsilon=config_obj.epsilon,
+                            device=load_device,
+                        )
+                        agent_white = PolicyAgent(
+                            board_size=config_obj.board_size,
+                            learning_rate=config_obj.learning_rate,
+                            epsilon=config_obj.epsilon,
+                            device=load_device,
+                        )
+                        agent_black.load_state_dict(black_state)
+                        agent_white.load_state_dict(white_state)
+                        agents = [agent_black, agent_white]
+                        config_obj.num_agents = 2
+
+                standings_payload = payload.get("standings", [])
+                standings_list: List[AgentStanding] = []
+                for entry in standings_payload:
+                    try:
+                        standings_list.append(AgentStanding(**entry))
+                    except TypeError:
+                        standings_list.append(
+                            AgentStanding(
+                                agent_index=entry.get("agent", 1) - 1,
+                                wins=entry.get("wins", 0),
+                                losses=entry.get("losses", 0),
+                                draws=entry.get("draws", 0),
+                                total_games=entry.get("games", 0),
+                                win_rate=entry.get("win_rate", 0.0),
+                                recent_win_rate=entry.get("recent_win_rate", 0.0),
+                                best_recent_win_rate=entry.get("best_recent", 0.0),
+                                average_loss=entry.get("avg_loss", 0.0),
+                            )
+                        )
+
                 st.session_state["agents"] = {
-                    "black": agent_black,
-                    "white": agent_white,
+                    "list": agents,
                     "config": config_obj,
+                    "standings": standings_list,
                 }
+                st.session_state["play_state"] = OmokState(size=config_obj.board_size, win_length=config_obj.win_length)
+                st.session_state["play_selected_agent"] = 0
+                st.session_state["play_message"] = "체크포인트 에이전트와의 대국을 시작해보세요!"
                 st.session_state["active_checkpoint"] = str(ckpt_path)
                 st.success(f"체크포인트를 불러왔습니다: {ckpt_path.name}")
 
